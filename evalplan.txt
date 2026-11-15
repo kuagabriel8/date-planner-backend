@@ -1,0 +1,416 @@
+================================================================================
+DATE PLANNER — LANGSMITH EVALUATION PLAN
+================================================================================
+Target graph:   date-planner-backend/graph/date_planner.py  (`graph`, a
+                 LangGraph StateGraph compiled from MessagesState)
+Reference doc:  https://docs.langchain.com/langsmith/evaluation
+                 (LangSmith "Evaluation concepts" — evaluators, datasets,
+                 experiments, offline vs. online eval)
+Also relevant:  https://docs.smith.langchain.com/evaluation/how_to_guides
+                 https://docs.smith.langchain.com/evaluation/concepts#agents
+                 https://www.langchain.com/langgraph  (multi-actor / stateful
+                 graph rationale — the reason evaluation must be trajectory-
+                 aware, not just final-output-aware, for this project)
+
+This document is a plan, not code. It defines WHAT to evaluate, WHY each
+evaluator type was chosen (with an explicit tie-back to LangSmith's own
+taxonomy and to general industry practice for LLM/agent evaluation), WHERE
+the test data comes from, and HOW the eval suite should be organized and run.
+
+================================================================================
+1. WHY EVALUATE THIS GRAPH AT ALL (AND WHY NOT JUST UNIT TESTS)
+================================================================================
+`date-planner-backend/tests/test_routing.py` already unit-tests
+`route_message()` — but only with HAND-CONSTRUCTED `AIMessage` objects that
+already contain the tool_calls we want to test. That proves the *routing
+function* is correct given a tool call. It proves NOTHING about whether the
+LLM actually PRODUCES the right tool call for a given user message. That is
+exactly the gap LangSmith evaluation is designed to close: deterministic code
+can verify deterministic logic, but the moment an LLM is in the loop
+(deciding whether to call `check_weather` vs `web_search`, or whether a
+message should update the `Profile` vs the `DateIdea` list), you need
+dataset-driven, repeatable evaluation against real or curated inputs, run as
+an "experiment" you can diff across prompt/model changes.
+
+This is industry standard, not a project-specific opinion:
+  - LangSmith's own docs frame evaluation as necessary "when your
+    application uses an LLM to make decisions" because unit tests can't
+    cover the combinatorial space of natural-language inputs
+    (https://docs.langchain.com/langsmith/evaluation).
+  - This mirrors OpenAI's "Evals" framework guidance and Microsoft's
+    "Evaluation of generative AI applications" guidance: deterministic code
+    paths get unit tests; probabilistic/LLM-decision paths get dataset +
+    evaluator based regression suites, because you cannot exhaustively
+    enumerate LLM behavior with assertions.
+  - Google's People + AI Guidebook and Anthropic's own "Building effective
+    agents" post both emphasize evaluating agent trajectories (which tools
+    were called, in what order) in addition to final output correctness —
+    which is why section 3 below is split into "trajectory" and "outcome"
+    evaluators rather than one blended judge.
+
+Conclusion: unit tests stay as-is (they're correct and cheap — keep them).
+This eval plan adds a SEPARATE, LLM-inclusive layer on top, run against
+LangSmith datasets, not pytest fixtures.
+
+================================================================================
+2. SCOPE — THE FIVE DECISION POINTS THAT NEED EVALUATION
+================================================================================
+Walking the graph (date_planner.py:379-393), there are five places where the
+LLM (not deterministic code) makes a decision that can silently go wrong:
+
+  [D1] date_planner node (line 233-269): given chat history + profile +
+       date ideas + instructions, decide whether to call UpdateMemory, call
+       an ACTION_TOOL, or just respond. This is the highest-leverage node —
+       every other node is downstream of its tool_calls.
+
+  [D2] Tool selection within D1 (tools.py ACTION_TOOLS): given D1 decided to
+       call a real-world tool, did it pick the RIGHT one? The system prompt
+       (date_planner.py:182-189) hard-codes strict routing rules
+       ("Singapore weather -> check_weather, never web_search"). Tool
+       docstrings in tools.py repeat this ("ALWAYS use this tool (never
+       web_search)"). Redundant instructions in two places is a strong
+       signal this has broken before and is worth a regression suite.
+
+  [D3] update_profile node (line 271-292): Trustcall extraction — did it
+       correctly patch existing Profile fields vs. leave them alone
+       (no_update), and did it avoid hallucinating fields the user never
+       stated?
+
+  [D4] update_date_ideas node (line 294-332): Trustcall extraction with
+       enable_inserts=True — did it correctly decide "new DateIdea" vs.
+       "patch existing row", and did it get status transitions right
+       (idea -> planned -> booked -> completed)?
+
+  [D5] Final assistant response (after any of the above resolve back to
+       date_planner): does it comply with the behavioral policy embedded in
+       the system prompt — specifically the "silent update" rules at lines
+       202-207 (don't mention profile updates, DO mention date-idea updates,
+       don't mention instruction updates, never ask permission before
+       saving a date idea)?
+
+Each of D1-D5 gets its own dataset + evaluator(s) below. Do not build one
+"does the final answer look good" evaluator and call it done — LangSmith's
+own agent-evaluation guidance and Anthropic's agent-evaluation practice both
+call out that black-box, final-output-only grading of an agent will pass
+runs that took a WRONG PATH to a coincidentally-plausible-looking answer
+(e.g., it hallucinates rain instead of calling check_weather, but still
+writes a sensible-sounding response). Trajectory evaluation is what catches
+that class of bug; it's why LangSmith traces are structured as full run
+trees rather than single input/output pairs in the first place.
+
+================================================================================
+3. EVALUATOR TYPES — CHOICE AND JUSTIFICATION
+================================================================================
+LangSmith documents four evaluator categories (docs.langchain.com/langsmith/
+evaluation): Human Review, Code Rules (heuristic), LLM-as-Judge, and Pairwise
+Comparison. Mapping our five decision points onto those categories:
+
+  --------------------------------------------------------------------------
+  D1 — Route selection (which node does UpdateMemory/tool_calls send us to)
+  --------------------------------------------------------------------------
+  Evaluator type : CODE (heuristic / exact-match)
+  Why            : `route_message()` is a pure function of
+                    `tool_calls[0]['name']` and `update_type`. The "correct"
+                    answer for a given input is a single categorical label
+                    (END / tools / update_profile / update_date_ideas /
+                    update_instructions), not a matter of degree or taste.
+                    LangSmith explicitly recommends code evaluators over
+                    LLM-as-judge whenever correctness is exactly checkable,
+                    because code evaluators are free, deterministic, and
+                    have zero judge-model variance — reserving LLM-as-judge
+                    budget for genuinely subjective criteria is standard
+                    practice (see docs.langchain.com/langsmith/evaluation,
+                    "Code Rules" vs "LLM-as-Judge" sections).
+  Metric         : exact-match accuracy over the dataset; also emit a
+                    confusion matrix (predicted route x expected route) so
+                    misrouted classes are visible, not just an aggregate %.
+
+  --------------------------------------------------------------------------
+  D2 — Tool selection (check_weather vs check_psi vs check_uv_index vs
+                        find_places vs web_search vs "no tool")
+  --------------------------------------------------------------------------
+  Evaluator type : CODE (set/exact-match on tool name) as the PRIMARY signal,
+                    with trajectory match against an expected tool SEQUENCE
+                    when a scenario requires more than one tool
+                    (e.g. "outdoor picnic this weekend" should trigger both
+                    check_weather AND check_uv_index before find_places).
+  Why            : Same reasoning as D1 — the system prompt encodes a hard
+                    lookup table ("topic X -> tool Y, never Z"), so there is
+                    one correct tool per topic. This is precisely the
+                    "trajectory evaluation" pattern LangSmith documents for
+                    agents: compare the actual sequence of tool calls in the
+                    run trace against an expected sequence, rather than only
+                    grading the final message. Using an LLM judge here would
+                    be strictly worse: it adds cost, latency, and judge
+                    noise to a question that already has a ground-truth
+                    answer.
+  Metric         : tool-call precision/recall against expected tool set;
+                    order-sensitivity only enforced where the prompt implies
+                    an order (e.g., weather/PSI/UV should be checked BEFORE
+                    an outdoor idea is proposed, not after).
+
+  --------------------------------------------------------------------------
+  D3 — Profile extraction (Trustcall -> Profile patch/no_update)
+  --------------------------------------------------------------------------
+  Evaluator type : CODE (structured diff) for field-level correctness, i.e.
+                    compare `profile.model_dump()` against a reference dict
+                    key-by-key. Add an LLM-as-judge ONLY for the
+                    `interests`/`dietary_restrictions` list fields, where
+                    reasonable paraphrases ("no pork" vs "halal") should
+                    both count as correct and a strict string-equality code
+                    check would produce false negatives.
+  Why            : Pydantic gives us a typed, structured target
+                    (`Profile` in date_planner.py:103-116) — this is exactly
+                    the case LangSmith calls out for code evaluators:
+                    structured-output correctness should be checked
+                    structurally, not by asking another LLM "does this look
+                    right?". Reserve the judge model for the few genuinely
+                    fuzzy free-text fields.
+  Metric         : per-field exact/fuzzy match rate; separately track
+                    false-positive hallucination rate (fields populated that
+                    the source message never mentioned) since Trustcall
+                    over-eagerly filling fields is a known failure mode of
+                    extraction agents and deserves its own number, not to be
+                    averaged away inside an aggregate accuracy score.
+
+  --------------------------------------------------------------------------
+  D4 — Date idea extraction (Trustcall with enable_inserts=True)
+  --------------------------------------------------------------------------
+  Evaluator type : CODE for insert-vs-patch decision and `status` field
+                    (closed categorical set, Literal["idea","planned",
+                    "booked","completed","archived"] in date_planner.py:132)
+                    + LLM-as-judge for whether `notes` captured the
+                    actionable specifics (line 127-131, "restaurant names,
+                    booking links, backup plans") since "did it capture the
+                    important detail" is inherently a judgment call, not a
+                    string match.
+  Why            : Same split logic as D3 — grade the structured/categorical
+                    parts deterministically, reserve judge calls for the
+                    open-ended text quality question. This hybrid pattern
+                    (code evaluator + judge evaluator on the SAME example,
+                    scoring different fields) is directly supported by
+                    LangSmith's evaluator model, which allows multiple named
+                    evaluators to run over one dataset and report separate
+                    feedback keys rather than forcing a single score.
+  Metric         : insert/patch classification accuracy; status-transition
+                    validity (e.g. never regress "booked" -> "idea" without
+                    an explicit cancellation in the input); judge score
+                    (1-5) on notes completeness, with the rubric embedded in
+                    the judge prompt (see section 5).
+
+  --------------------------------------------------------------------------
+  D5 — Final response policy compliance
+  --------------------------------------------------------------------------
+  Evaluator type : LLM-AS-JUDGE, binary pass/fail per rule, one rule per
+                    evaluator call (NOT one judge asked five questions at
+                    once).
+  Why            : This is the canonical LLM-as-judge use case per LangSmith
+                    docs — "AI models scoring performance against criteria"
+                    where the criteria are behavioral/stylistic and not
+                    reducible to a string match: "did the response avoid
+                    mentioning the profile was updated" requires semantic
+                    understanding of the reply, not a keyword search
+                    (a response could avoid the literal word "profile" while
+                    still leaking the update, or vice versa mention
+                    "profile" harmlessly in a suggestion). Industry practice
+                    (LangSmith docs; also OpenAI Evals model-graded eval
+                    guidance) recommends narrow, single-criterion judge
+                    prompts over one multi-part rubric, because judge
+                    reliability drops and failure attribution gets murky
+                    when one call is asked to score several unrelated things
+                    at once — splitting into four separate binary judges
+                    (one per rule below) keeps each judge prompt simple
+                    enough to be reliable and keeps failures individually
+                    diagnosable in the LangSmith UI.
+  Rules to judge (each = its own evaluator, source = date_planner.py:202-
+                   207):
+     R1: response must NOT reveal that the user's profile was updated
+     R2: response MUST mention it when the date-idea list was updated
+     R3: response must NOT reveal that instructions were updated
+     R4: when a new date idea was saved, response must NOT ask the user
+         for permission/confirmation first (must be a statement, not a
+         question like "should I save this?")
+  Metric         : pass-rate per rule, tracked separately (a single
+                    aggregate "policy score" would hide which specific rule
+                    is regressing after a prompt edit).
+
+  --------------------------------------------------------------------------
+  PAIRWISE COMPARISON — used for prompt/model iteration, not CI gating
+  --------------------------------------------------------------------------
+  Evaluator type : PAIRWISE (LangSmith's 4th category)
+  Why            : When changing MODEL_SYSTEM_MESSAGE (date_planner.py:159)
+                    or swapping the model (currently gpt-4o, line 147),
+                    absolute pass/fail scores are noisy for open-ended
+                    "helpfulness/creativity of date idea" quality. LangSmith
+                    docs recommend pairwise comparison specifically for this
+                    "is version B better than version A" question, since
+                    judges are more consistent at relative ranking than
+                    absolute scoring — this matches the general finding
+                    (also echoed in Chatbot Arena / LMSYS methodology) that
+                    comparative judgments are more reliable than pointwise
+                    Likert-style scoring from an LLM judge.
+  Metric         : win rate of candidate vs. baseline over the D1 "response
+                    quality" subset only, run manually before adopting a
+                    prompt change — not part of automated CI gating.
+
+================================================================================
+4. DATASETS — WHERE EXAMPLES COME FROM
+================================================================================
+LangSmith's docs describe examples as coming from three sources: manually
+curated cases, historical production traces, and synthetic generation. Use
+all three, but keep them in SEPARATE datasets so regressions are traceable
+to a source:
+
+  4.1 `date-planner-routing-golden` (manually curated, ~40-60 examples)
+      Hand-write these directly from the routing rules already encoded in
+      the system prompt (date_planner.py:182-189) and tool docstrings
+      (tools.py). Because the rules are explicit ("Singapore weather ->
+      check_weather, never web_search"), each rule line is a template for
+      several paraphrased user messages. Include adversarial near-misses
+      on purpose:
+        - "is it going to rain in Bishan later" -> check_weather
+        - "any haze today" -> check_psi
+        - "how strong is the sun right now" -> check_uv_index
+        - "what's a good rooftop bar in Tanjong Pagar" -> find_places
+        - "any jazz festivals this month" -> web_search (NOT covered by a
+          dedicated tool — this is the negative case that catches
+          over-triggering)
+        - "weather in Tokyo" -> should NOT call check_weather (NEA is
+          Singapore-only; this exposes whether the model over-generalizes
+          the tool beyond its documented scope)
+      This dataset is the one that gates D1/D2 code evaluators and should
+      run on every PR that touches date_planner.py or tools.py.
+
+  4.2 `date-planner-production-traces` (pulled from real LangSmith traces)
+      Once the graph has real usage (via `langgraph dev` locally or
+      LangGraph Cloud), periodically export a sample of real runs into a
+      dataset — LangSmith supports adding a run directly to a dataset from
+      the trace UI. Prioritize traces where a user later corrected the
+      assistant (visible as a follow-up message contradicting the prior
+      turn) — these are free-of-charge labeled negative examples; the
+      correction message IS the ground truth for what should have happened.
+      This is the "historical production data" source LangSmith calls out
+      explicitly, and it's the highest-signal dataset because it reflects
+      real user phrasing rather than the somewhat clean phrasing a human
+      writing test cases tends to produce.
+
+  4.3 `date-planner-extraction-synthetic` (LLM-generated, D3/D4)
+      Generate synthetic multi-turn conversations covering profile/date-idea
+      updates, since hand-writing enough conversational variety is slow.
+      Use a stronger model (or the same gpt-4o) with an explicit generation
+      prompt asking for realistic Singapore date-planning conversations
+      that mention specific extractable facts, then hand-verify the
+      reference Profile/DateIdea labels before trusting the dataset (never
+      trust unverified synthetic labels as ground truth — LangSmith docs
+      flag synthetic data as the lowest-trust source of the three, useful
+      for coverage/volume but requiring a human spot-check pass).
+
+  4.4 `date-planner-policy-compliance` (manually curated, D5)
+      Small (~20-30 examples), one per rule (R1-R4), each an already-known
+      correct system+tool-call+response triple with the response text
+      deliberately mutated to violate the rule in a "should fail" sibling
+      example. Paired good/bad examples make it easy to sanity-check that
+      the judge evaluator actually discriminates (run it on the "bad"
+      sibling first — if it doesn't flag the obvious violation, the judge
+      prompt itself is broken before it's ever run against a real
+      candidate).
+
+================================================================================
+5. LLM-AS-JUDGE PROMPT DESIGN (for D5 and the fuzzy fields in D3/D4)
+================================================================================
+Follow LangSmith's own recommended structure for judge prompts (referenced
+in docs.langchain.com/langsmith/evaluation and consistent with general
+model-graded-eval practice):
+  - One criterion per judge call (see R1-R4 above — already split).
+  - Binary output (pass/fail) preferred over 1-10 scales for policy rules,
+    because binary criteria are what R1-R4 actually are (a rule either was
+    or wasn't violated); reserve numeric scales (1-5) for genuinely
+    continuous quality judgments like the D4 "notes completeness" score.
+  - Always include the FULL conversation + tool outputs in the judge's
+    context, not just the final message — R1/R3 specifically require the
+    judge to know whether a profile/instructions update actually happened
+    (from the tool_call trace) to check whether the response wrongly
+    revealed it.
+  - Provide 1-2 few-shot examples of a clear pass and clear fail directly
+    in the judge prompt, sourced from the paired examples in dataset 4.4.
+  - Log judge rationale (a short "reasoning" field before the verdict), not
+    just the verdict, so a human can audit disagreements — LangSmith
+    surfaces this in the experiment UI per-example, and it's what makes it
+    possible to tell "the candidate is actually wrong" from "the judge
+    misfired."
+
+================================================================================
+6. HOW TO ORGANIZE AND RUN THE SUITE
+================================================================================
+  - Directory: `date-planner-backend/evals/`
+      evals/
+        datasets/          # scripts that build/upload the 4 datasets above
+        evaluators/
+          code_route_match.py       # D1
+          code_tool_match.py        # D2
+          code_profile_diff.py      # D3 structured fields
+          code_dateidea_diff.py     # D4 structured fields
+          judge_list_field_match.py # D3 fuzzy fields (interests, diet)
+          judge_notes_completeness.py # D4 notes quality
+          judge_policy_r1_no_leak_profile.py   # D5
+          judge_policy_r2_mentions_dateidea.py # D5
+          judge_policy_r3_no_leak_instructions.py # D5
+          judge_policy_r4_no_permission_ask.py # D5
+        run_experiment.py  # invokes `graph` (imported from
+                            # graph/date_planner.py) against each dataset,
+                            # attaches the matching evaluator(s), logs an
+                            # experiment to LangSmith
+  - CI gating (fast, deterministic, cheap — run on every PR touching
+    graph/date_planner.py, graph/tools.py, or graph/configuration.py):
+      dataset 4.1 (routing-golden) + code evaluators D1/D2 only.
+      Threshold: fail the PR if exact-match accuracy drops below the
+      current baseline (track baseline as a committed number in this repo,
+      update it deliberately alongside intentional prompt changes — never
+      silently).
+  - Nightly / pre-release (slower, costs judge-model tokens — not on every
+    PR): full run across all four datasets, all evaluator types including
+    D5 judges. Compare against the previous experiment in LangSmith's
+    experiment-diff view.
+  - Manual, pre-merge for any MODEL_SYSTEM_MESSAGE or model-swap change:
+    pairwise comparison (section 3) of the response-quality subset,
+    reviewed by a human before merging — LangSmith's pairwise UI is built
+    exactly for this side-by-side review step.
+
+================================================================================
+7. METRICS SUMMARY (what gets tracked over time, per dataset)
+================================================================================
+  D1 routing-golden      : exact-match accuracy + confusion matrix
+  D2 tool selection      : precision/recall per tool + wrong-tool rate
+                            (over-triggering / under-triggering tracked
+                            separately, since "called nothing" and "called
+                            the wrong tool" are different bugs)
+  D3 profile extraction  : field-level accuracy + hallucination rate
+  D4 date idea extraction: insert/patch accuracy + status-transition
+                            validity + notes-completeness judge score (1-5)
+  D5 policy compliance   : pass-rate per rule (R1, R2, R3, R4 reported
+                            individually, never averaged into one number)
+  Pairwise (ad hoc)      : win rate vs. baseline, manual review only
+
+Every metric above is reported PER DATASET, PER RULE/FIELD — deliberately
+not collapsed into a single "eval score." A blended score is the most
+common way these suites go stale in practice: it lets a regression in one
+narrow area (e.g. R4 permission-asking creeping back in) hide inside an
+improvement somewhere else. Keeping metrics disaggregated is what makes the
+LangSmith experiment-diff view actually useful for catching regressions.
+
+================================================================================
+8. OPEN ITEMS / NOT YET DECIDED (flag for follow-up, not blocking)
+================================================================================
+  - Which judge model to standardize on for D5 (gpt-4o itself vs. a
+    different model, to avoid the same-model-grades-itself bias some teams
+    flag as a self-preference risk in model-graded eval literature).
+  - Whether `find_places` and `web_search` results (live external APIs)
+    should be mocked/cached for the eval suite to keep D2 experiments
+    deterministic and cheap, vs. hitting real APIs (current tests.py tools
+    already hit live NEA/Google APIs with no mocking — same tradeoff
+    exists here and should be decided consistently with that testing
+    approach).
+  - Cadence for refreshing dataset 4.2 (production traces) — proposal: monthly,
+    or triggered whenever a user-correction pattern is spotted in the
+    LangSmith trace UI.
+================================================================================

@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.langgraph_api/
+.pytest_cache/
+
+# keep .vscode/tasks.json and settings.json committed; ignore personal-only overrides
+.vscode/*.local.json
+
+
